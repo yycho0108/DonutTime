@@ -2,12 +2,13 @@
 
 from datetime import date
 
-from typing import List
+from typing import List, Optional
 import numpy as np
 import pyomo.environ as pyo
 from functools import partial
 import itertools
 import json
+import multiprocessing as mp
 
 
 def _entropy(P):
@@ -53,15 +54,17 @@ def transition_model(P, G, C, Q,
 def minimize_overlap(model, *, T: int, N: int, K: int,
                      r_talk: float,
                      r_hear: float,
-                     gamma: float = 1.0):
+                     gamma: float = 1.0,
+                     rollout: Optional[int] = None):
     """Just count duplicates."""
+    if rollout is None:
+        rollout = T
     G = np.asarray([[[model.G[i, j, k] for k in range(K)] for j in range(N)]
                     for i in range(T)])
-    # H = np.einsum('bij,bkj->bik', G, G)
     H = [Gi @ Gi.T for Gi in G]
     dup = []
 
-    for dt in range(1, T):
+    for dt in range(1, rollout):
         # Linearly weighted (needed?)
         # weight = (T - dt)
 
@@ -71,7 +74,8 @@ def minimize_overlap(model, *, T: int, N: int, K: int,
         # Exponentially weighted,
         # but with integers.
         #, in case it helps :P
-        weight = 2.0 ** (T - dt - 1)
+        weight = 2.0 ** (T - dt - 2)
+        print(F'dt={dt}, weight={weight}')
         for i in range(dt, T):
             dup.append(weight * np.sum(H[i] * H[i - dt]))
     return sum(dup)
@@ -96,15 +100,15 @@ def minimize_entropy(model, *, T: int, N: int, K: int, D: int,
     Q = np.asarray([[model.Q[i, j] for j in range(N)] for i in range(N)])
 
     if gamma < 1.0:
-        ss = []
+        rewards = []
         for i in range(T):
             P = transition_model(P, G[i], C, Q, r_talk, r_hear)
             H2 = _entropy2(P, N)  # < should this be discounted?
             IG = H - H2
             reward = (gamma ** i) * IG
             H = H2
-            ss.append(reward)
-        score = sum(ss)
+            rewards.append(reward)
+        score = sum(rewards)
     else:
         H0 = H
         for i in range(T):
@@ -160,31 +164,20 @@ def solve_donuts(
     model.G = pyo.Var(model.T, model.N, model.K,
                       within=pyo.Binary)
 
-    #obj = partial(minimize_entropy, T=T, N=N, K=K,
+    #obj = partial(minimize_entropy, T=T, N=N, K=K,D=D,
     #              r_talk=r_talk, r_hear=r_hear, gamma=gamma)
     obj = partial(minimize_overlap, T=T, N=N, K=K,
                   r_talk=r_talk, r_hear=r_hear, gamma=gamma)
     model.obj = pyo.Objective(expr=obj,
                               # sense=pyo.maximize,
-                              sense=pyo.minimize)
+                              sense=pyo.minimize
+                              )
 
-    #def _rule_attendance(model, i):
-    #    #return sum(model.G[0, i, j] for j in model.K) <= model.A[i]
-    #    #if model.A[i]:
-    #    if A[i]:
-    #        return sum(model.G[0, i, j] for j in model.K) == 1
-    #    else:
-    #        return sum(model.G[0, i, j] for j in model.K) == 0
-    #model.attendance = pyo.Constraint(model.N,
-    #                                  rule=_rule_attendance)
     def _rule_one_group(model, t, i):
         if t == 0:
             # [This week]
             # Everyone who has attended must be assigned to one group.
-            if A[i]:
-                return sum(model.G[0, i, j] for j in model.K) == 1
-            else:
-                return sum(model.G[0, i, j] for j in model.K) == 0
+            return sum(model.G[t, i, j] for j in model.K) == int(A[i])
         # In future weeks, we assume everyone attended.
         # each person may be assigned to only one group.
         return sum(model.G[t, i, j] for j in model.K) == 1
@@ -208,9 +201,8 @@ def solve_donuts(
 
     # Solve.
     solver = pyo.SolverFactory('mindtpy')
-    results = solver.solve(model, tee=True,
+    results = solver.solve(model, tee=False,
                            time_limit=180)
-    print(results)
 
     def _value(i, j, k):
         try:
@@ -220,15 +212,15 @@ def solve_donuts(
     G = np.asarray(
         [[[_value(i, j, k) for k in range(K)] for j in range(N)]
          for i in range(T)])
-    print('G', G)
-
-    # print(P)
-    for Gi in G:
-        P = transition_model(P, Gi, C, Q, r_talk, r_hear)
-        # print(P)
-    # print(pyo.value(model.obj))
-
-    return G[0]
+    if False:
+        print('G', G)
+        print(P)
+        for Gi in G:
+            P = transition_model(P, Gi, C, Q, r_talk, r_hear)
+            print(P)
+    print('Objective value:')
+    print(pyo.value(model.obj))
+    return G
 
 
 def main_test():
@@ -261,29 +253,39 @@ def main_test():
                  gamma=1.0)
 
 
+def solve_rand(seed: int, N: int, T: int, K: int, D: int):
+    rng = np.random.default_rng(seed)
+    P = 1.0 - np.eye(N)
+
+    # Generate subteams.
+    C = np.zeros((D, N), dtype=bool)
+    # I = np.random.permutation(N) % D
+    I = rng.choice(D, size=N)
+    C[I, np.arange(N)] = 1
+
+    # Generate attendance.
+    A = rng.choice(2, size=N).astype(bool)
+    solve_donuts(P, C, A, T=T, K=K)
+
+
 def main_rand():
     """solve randomized problem."""
     np.random.seed(0)
 
-    N: int = 15  # num people.
-    T: int = 3  # lookahead horizon
+    N: int = 17  # num people.
+    T: int = 3  # lookahead horizon.
     K: int = 3  # num groups.
-    D: int = 4  # number of intra-lab teams.
-    # packing team
-    # CRM team
-
-    P = 1.0 - np.eye(N)
-    C = np.zeros((D, N), dtype=bool)
-    I = np.random.permutation(N) % D
-    C[I, np.arange(N)] = 1
-    A = np.random.choice(2, size=N).astype(bool)
-
-    solve_donuts(P, C, A, T=T, K=K)
+    D: int = 5  # number of intra-lab teams.
+    solve = partial(solve_rand, N=N, T=T, K=K, D=D)
+    print(mp.Pool(8).map_async(solve, range(128)).get())
 
 
 def main():
     # Lookahead horizon.
-    T: int = 4
+    # NOTE(ycho): for whatever reason,
+    # when T<=2, the solubility depends on the
+    # attendance configuration. This needs to be debugged.
+    T: int = 3
 
     rooms: List[str] = [
         'current room',
@@ -321,6 +323,9 @@ def main():
     p2i = {p: i for i, p in enumerate(persons)}
 
     # Sub-teams.
+    # NOTE(ycho): sub-teams are only used for
+    # `minimize_entropy` objective,
+    # which is disabled because it's too expensive.
     sub_teams: List[List[str]] = [
         # CRM team
         ['minchan', 'junhyek', 'jaehyung'],
@@ -345,7 +350,7 @@ def main():
     # Fill in this week's attendance.
     attendance: List[str] = [
         'beomjoon',
-        # 'changjae',
+        'changjae',
         'dongchan',
         'dongryung',
         'dongwon',
@@ -370,24 +375,29 @@ def main():
     P = 1 - np.eye(N)
 
     # Compute group assignments.
-    groups = [[] for _ in rooms]
-    G = solve_donuts(P, C, A, T, K)
-    index = np.argwhere(G)
-    for pi, gi in index:
-        groups[gi].append(persons[pi])
+    Gs = solve_donuts(P, C, A, T, K)
+    for t, G in enumerate(Gs):
+        index = np.argwhere(G)
 
-    for room, persons in zip(rooms, groups):
-        print(F'== room [{room}] == ')
-        print(F'[{persons}]')
+        groups = [[] for _ in rooms]
+        for pi, gi in index:
+            groups[gi].append(persons[pi])
 
-    # Export output.
-    today = date.today()
-    filename = today.strftime('%Y-%m-%d.json')
-    with open(filename, 'w') as fp:
-        json.dump({r: g for r, g in zip(rooms, groups)}, fp,
-                  indent=4)
+        print(F'==week {t:02d} == ')
+        for r, g in zip(rooms, groups):
+            print(F'\t== room [{r}] == ')
+            print(F'\t[{g}]')
+
+        if t > 0:
+            continue
+        # Export this week's output.
+        today = date.today()
+        filename = today.strftime('%Y-%m-%d.json')
+        with open(filename, 'w') as fp:
+            json.dump({r: g for r, g in zip(rooms, groups)}, fp,
+                      indent=4)
 
 
 if __name__ == '__main__':
-    main()
     # main_rand()
+    main()
