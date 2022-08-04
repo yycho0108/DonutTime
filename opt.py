@@ -5,10 +5,13 @@ from datetime import date
 from typing import List, Optional
 import numpy as np
 import pyomo.environ as pyo
+from pyomo.opt import SolverFactory, OptSolver
 from functools import partial
 import itertools
 import json
 import multiprocessing as mp
+from collections import namedtuple
+from matplotlib import pyplot as plt
 
 
 def _entropy(P):
@@ -51,7 +54,8 @@ def transition_model(P, G, C, Q,
     return P
 
 
-def minimize_overlap(model, *, T: int, N: int, K: int,
+def minimize_overlap(model, *,
+                     T: int, N: int, K: int, D: int,
                      r_talk: float,
                      r_hear: float,
                      gamma: float = 1.0,
@@ -59,9 +63,14 @@ def minimize_overlap(model, *, T: int, N: int, K: int,
     """Just count duplicates."""
     if rollout is None:
         rollout = T
+
     G = np.asarray([[[model.G[i, j, k] for k in range(K)] for j in range(N)]
                     for i in range(T)])
-    H = [Gi @ Gi.T for Gi in G]
+    C = np.asarray([
+        [model.C[d, n] for n in range(N)]
+        for d in range(D)])
+    H = [4 * Gi @ Gi.T + C.T @ C for Gi in G]
+    # H = [Gi @ Gi.T for Gi in G]
     dup = []
 
     for dt in range(1, rollout):
@@ -74,10 +83,12 @@ def minimize_overlap(model, *, T: int, N: int, K: int,
         # Exponentially weighted,
         # but with integers.
         #, in case it helps :P
-        weight = 2.0 ** (T - dt - 2)
-        print(F'dt={dt}, weight={weight}')
+        weight = int(4.0 ** (T - dt - 1))
+        # assert(weight > 0)
+        # print(F'dt={dt}, weight={weight}')
         for i in range(dt, T):
-            dup.append(weight * np.sum(H[i] * H[i - dt]))
+            # dup.append(weight * np.sum(H[i] * H[i - dt]))
+            dup.append(weight * sum(sum(H[i] * H[i - dt])))
     return sum(dup)
 
 
@@ -118,6 +129,51 @@ def minimize_entropy(model, *, T: int, N: int, K: int, D: int,
     return H
 
 
+def solve_donuts_monte_carlo(
+        P: np.ndarray,  # initial covariance
+        C: np.ndarray,  # correlation matrix for intra-lab teams
+        A: np.ndarray,  # binary variable indicating attendance
+        T: int = 1,  # rollout horizon I guess...
+        K: int = 3,  # number of groups to create.
+        num_iter: int = 4096):
+    Model = namedtuple('Model', ('G', 'C'))
+
+    best_cost: float = np.inf
+    best_G = None
+    costs = []
+
+    N: int = P.shape[0]
+    D: int = C.shape[0]
+    G = np.zeros((T, N, K), dtype=bool)
+    for t in range(T):
+        G[t][np.arange(N), np.arange(N) % K] = 1
+
+    for i in range(num_iter):
+        # Try random group assignments.
+        G[0] = 0
+        G[0][A.astype(bool), np.random.permutation(A.sum()) %
+             K] = 1  # < attendance based
+        for t in range(1, T):
+            G[t] = 0
+            G[t, np.arange(N), np.random.permutation(N) % K] = 1
+        #G[1:] = np.random.permutation(
+        #    G[1:].transpose(2, 0, 1)).transpose(1, 2, 0)
+
+        # np.random.permutation(
+        # G[1:][:, [np.random.permutation(N) % K for _ in range(T - 1)]] = 1
+        # print(i, G)
+        model = Model(G=G, C=C)
+
+        # Evaluate cost and track best cost.
+        cost = minimize_overlap(model, T=T, N=N, K=K, D=D, r_talk=0, r_hear=0)
+        costs.append(cost)
+        if cost < best_cost:
+            best_cost = cost
+            best_G = G.copy()
+    # print(best_G)
+    return (best_cost, best_G, costs)
+
+
 def solve_donuts(
         P: np.ndarray,  # initial covariance
         C: np.ndarray,  # correlation matrix for intra-lab teams
@@ -130,7 +186,8 @@ def solve_donuts(
         r_hear: float = 0.1 + 0.2,
         q_team: float = 0.1,
         q_else: float = 0.5,
-        gamma: float = 0.99
+        gamma: float = 0.99,
+        G0: int = None
 ):
     N: int = P.shape[0]
     D: int = C.shape[0]
@@ -161,17 +218,23 @@ def solve_donuts(
         lambda model, i: A[i]), within=pyo.Binary)  # attendance this week
 
     # Variable for Group assignments
-    model.G = pyo.Var(model.T, model.N, model.K,
-                      within=pyo.Binary)
+    if G0 is not None:
+        print('init')
+        model.G = pyo.Var(model.T, model.N, model.K,
+                          within=pyo.Binary,
+                          initialize=lambda model, i, j, k: G0[i][j, k])
+    else:
+        model.G = pyo.Var(model.T, model.N, model.K,
+                          within=pyo.Binary)
 
     #obj = partial(minimize_entropy, T=T, N=N, K=K,D=D,
     #              r_talk=r_talk, r_hear=r_hear, gamma=gamma)
-    obj = partial(minimize_overlap, T=T, N=N, K=K,
+    obj = partial(minimize_overlap, T=T, N=N, K=K, D=D,
                   r_talk=r_talk, r_hear=r_hear, gamma=gamma)
-    model.obj = pyo.Objective(expr=obj,
-                              # sense=pyo.maximize,
-                              sense=pyo.minimize
-                              )
+    model.objective = pyo.Objective(expr=obj,
+                                    # sense=pyo.maximize,
+                                    sense=pyo.minimize)
+    model.objective.display()
 
     def _rule_one_group(model, t, i):
         if t == 0:
@@ -192,17 +255,38 @@ def solve_donuts(
         else:
             Nt = N
         # TODO(ycho): which is a better objective?
-        # max_group_size = (Nt + K - 1) // K
-        # return sum(model.G[t, i, j] for i in model.N) <= max_group_size
+        max_group_size = (Nt + K - 1) // K
+        return sum(model.G[t, i, j] for i in model.N) <= max_group_size
+    model.group_size_max = pyo.Constraint(model.T, model.K,
+                                          rule=_rule_group_size)
+
+    def _rule_group_size_min(model, t, j):
+        if t == 0:
+            Nt = A.sum()
+        else:
+            Nt = N
+        # TODO(ycho): which is a better objective?
         min_group_size = Nt // K
         return sum(model.G[t, i, j] for i in model.N) >= min_group_size
-    model.group_size = pyo.Constraint(model.T, model.K,
-                                      rule=_rule_group_size)
+    model.group_size_min = pyo.Constraint(model.T, model.K,
+                                          rule=_rule_group_size_min)
 
     # Solve.
     solver = pyo.SolverFactory('mindtpy')
-    results = solver.solve(model, tee=False,
-                           time_limit=180)
+    # solver = pyo.SolverFactory('bonmin')
+    # solver = pyo.SolverFactory('gurobi', solver_io='python')
+    results = solver.solve(model, tee=True,
+            iteration_limit=128,
+            stalling_limit=64,
+                           # strategy='OA',
+                           # strategy='FP',
+                           # init_strategy='FP',
+                           # solution_pool=True,
+                           # iteration_limit=128,
+                           # num_solution_iteration=10,
+                           # mip_solver='cplex_persistent', #??
+                           # time_limit=180
+                           )
 
     def _value(i, j, k):
         try:
@@ -218,9 +302,9 @@ def solve_donuts(
         for Gi in G:
             P = transition_model(P, Gi, C, Q, r_talk, r_hear)
             print(P)
-    print('Objective value:')
-    print(pyo.value(model.obj))
-    return G
+    # print('Objective value:')
+    # print(pyo.value(model.objective))
+    return pyo.value(model.objective), G
 
 
 def main_test():
@@ -290,7 +374,10 @@ def main():
     rooms: List[str] = [
         'current room',
         'imcube',
-        'elsewhere in the universe'
+        'elsewhere in the universe',
+        # 'one more room!',
+        # 'alpha',
+        # 'beta'
     ]
 
     # Number of donut-time discussion
@@ -372,10 +459,39 @@ def main():
         A[p2i[person]] = 1
 
     # Arbitrary P for now..
+    # NOTE(ycho): unused for `minimize_overlap` objective.
     P = 1 - np.eye(N)
 
     # Compute group assignments.
-    Gs = solve_donuts(P, C, A, T, K)
+    random_cost, GsMC, costs = solve_donuts_monte_carlo(P, C, A, T, K)
+    best_cost, GsOpt = solve_donuts(P, C, A, T, K,
+                                    G0=GsMC)
+    if best_cost < random_cost:
+        Gs = GsOpt
+        print(
+            F'Better than best from monte carlo simulation:'
+            + F'{best_cost} < {random_cost}'
+        )
+    else:
+        Gs = GsMC
+        print(
+            F'Worse than best from monte carlo simulation:'
+            + F'{best_cost} >= {random_cost}'
+        )
+    #plt.hist(costs, bins=32)
+    #plt.axvline(x=best_cost, color='r')
+    #plt.show()
+
+    # As validation, look for overlaps.
+    mask = 1 - np.eye(N)
+    mask[np.triu_indices_from(mask)] = 0
+    for G0, G1 in zip(Gs[:-1], Gs[1:]):
+        pairs = np.argwhere(np.logical_and.reduce(
+            [G0 @ G0.T, G1 @ G1.T, mask]))
+        print('>')
+        for i, j in pairs:
+            print(persons[i], persons[j])
+
     for t, G in enumerate(Gs):
         index = np.argwhere(G)
 
@@ -386,7 +502,7 @@ def main():
         print(F'==week {t:02d} == ')
         for r, g in zip(rooms, groups):
             print(F'\t== room [{r}] == ')
-            print(F'\t[{g}]')
+            print(F'\t{g}')
 
         if t > 0:
             continue
