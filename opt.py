@@ -563,14 +563,24 @@ def main():
             print(F'\t== room [{r}] == ')
             print(F'\t{g}')
 
-        if t > 0:
+        if t != 0:
             continue
+
         # Export this week's output.
         today = date.today()
         filename = today.strftime('%Y-%m-%d.json')
-        with open(filename, 'w') as fp:
-            json.dump({r: g for r, g in zip(rooms, groups)}, fp,
-                      indent=4)
+        if Path(filename).exists():
+            write_output = False
+            response = input(
+                F'File {filename} already exists! overwrite? (y/N)')
+            if (isinstance(response, str) and len(response)
+                    > 0 and response[0].lower() == 'y'):
+                write_output = True
+        if write_output:
+            print('writing.')
+            with open(filename, 'w') as fp:
+                json.dump({r: g for r, g in zip(rooms, groups)}, fp,
+                          indent=4)
 
 
 if __name__ == '__main__':
