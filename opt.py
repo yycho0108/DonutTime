@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 
-from datetime import date
+from datetime import date, datetime
 
-from typing import List, Optional
+from pathlib import Path
+from typing import List, Optional, Dict
 import numpy as np
 import pyomo.environ as pyo
 from pyomo.opt import SolverFactory, OptSolver
@@ -12,6 +13,7 @@ import json
 import multiprocessing as mp
 from collections import namedtuple
 from matplotlib import pyplot as plt
+import logging
 
 
 def _entropy(P):
@@ -59,16 +61,26 @@ def minimize_overlap(model, *,
                      r_talk: float,
                      r_hear: float,
                      gamma: float = 1.0,
-                     rollout: Optional[int] = None):
+                     rollout: Optional[int] = None,
+                     G_prvs: Optional[List[np.ndarray]] = None
+                     ):
     """Just count duplicates."""
     if rollout is None:
         rollout = T
 
     G = np.asarray([[[model.G[i, j, k] for k in range(K)] for j in range(N)]
                     for i in range(T)])
+    if G_prvs is not None:
+        G = np.concatenate([G_prvs, G], axis=0)
+        # NOTE(ycho): rollout only accounts for the future,
+        # but now we need to incorporate the history as well. :)
+        rollout += len(G_prvs)
+
     C = np.asarray([
         [model.C[d, n] for n in range(N)]
         for d in range(D)])
+    # FIXME(ycho): !!!!HARDCODED WEIGHTING
+    # FOR SUBTEAM GROUPS!!!!
     H = [4 * Gi @ Gi.T + C.T @ C for Gi in G]
     # H = [Gi @ Gi.T for Gi in G]
     dup = []
@@ -135,7 +147,9 @@ def solve_donuts_monte_carlo(
         A: np.ndarray,  # binary variable indicating attendance
         T: int = 1,  # rollout horizon I guess...
         K: int = 3,  # number of groups to create.
-        num_iter: int = 4096):
+        num_iter: int = 16384,
+        G_prvs: Optional[List[np.ndarray]] = None,
+):
     Model = namedtuple('Model', ('G', 'C'))
 
     best_cost: float = np.inf
@@ -165,7 +179,8 @@ def solve_donuts_monte_carlo(
         model = Model(G=G, C=C)
 
         # Evaluate cost and track best cost.
-        cost = minimize_overlap(model, T=T, N=N, K=K, D=D, r_talk=0, r_hear=0)
+        cost = minimize_overlap(model, T=T, N=N, K=K, D=D, r_talk=0, r_hear=0,
+                                G_prvs=G_prvs)
         costs.append(cost)
         if cost < best_cost:
             best_cost = cost
@@ -187,7 +202,8 @@ def solve_donuts(
         q_team: float = 0.1,
         q_else: float = 0.5,
         gamma: float = 0.99,
-        G0: int = None
+        G0: int = None,
+        G_prvs: Optional[List[np.ndarray]] = None
 ):
     N: int = P.shape[0]
     D: int = C.shape[0]
@@ -230,7 +246,8 @@ def solve_donuts(
     #obj = partial(minimize_entropy, T=T, N=N, K=K,D=D,
     #              r_talk=r_talk, r_hear=r_hear, gamma=gamma)
     obj = partial(minimize_overlap, T=T, N=N, K=K, D=D,
-                  r_talk=r_talk, r_hear=r_hear, gamma=gamma)
+                  r_talk=r_talk, r_hear=r_hear, gamma=gamma,
+                  G_prvs=G_prvs)
     model.objective = pyo.Objective(expr=obj,
                                     # sense=pyo.maximize,
                                     sense=pyo.minimize)
@@ -276,8 +293,8 @@ def solve_donuts(
     # solver = pyo.SolverFactory('bonmin')
     # solver = pyo.SolverFactory('gurobi', solver_io='python')
     results = solver.solve(model, tee=True,
-            iteration_limit=128,
-            stalling_limit=64,
+                           iteration_limit=128,
+                           stalling_limit=64,
                            # strategy='OA',
                            # strategy='FP',
                            # init_strategy='FP',
@@ -365,6 +382,9 @@ def main_rand():
 
 
 def main():
+    np.random.seed(0)
+    # Lookback horizon.
+    B: int = 2
     # Lookahead horizon.
     # NOTE(ycho): for whatever reason,
     # when T<=2, the solubility depends on the
@@ -437,8 +457,8 @@ def main():
     # Fill in this week's attendance.
     attendance: List[str] = [
         'beomjoon',
-        'changjae',
-        'dongchan',
+        # 'changjae',
+        # 'dongchan',
         'dongryung',
         'dongwon',
         'junhyek',
@@ -447,12 +467,12 @@ def main():
         'jamie',
         'jisu',
         'jiyong',
-        'junyeob',
+        # 'junyeob',
         'minchan',
         'quang-minh',
         'sanghyeon',
         'wonjae',
-        'yoonwoo'
+        # 'yoonwoo'
     ]
     A = np.zeros((N,), dtype=bool)
     for person in attendance:
@@ -462,25 +482,62 @@ def main():
     # NOTE(ycho): unused for `minimize_overlap` objective.
     P = 1 - np.eye(N)
 
+    # Prepend last weeks' results.
+    if B > 0:
+        prev_assignments = []
+        for f in Path('.').glob('*.json'):
+            try:
+                prev_date = datetime.strptime(f.stem, '%Y-%m-%d')
+                if prev_date.day >= date.today().day:
+                    continue
+                prev_assignments.append((T, f))
+            except Exception as e:
+                logging.debug(F'{e}')
+                continue
+        prev_assignments = sorted(prev_assignments)[-B:]
+
+        G_prvs = []
+        for _, filename in prev_assignments:
+            with open(filename, 'r') as fp:
+                # G = np.zeros((T, N, K), dtype=bool)
+                prv: Dict[str, List[str]] = json.load(fp)
+                G_prv = []
+                for _, v in prv.items():
+                    room = np.zeros((N,), dtype=bool)
+                    for p in v:
+                        room[p2i[p]] = 1
+                    G_prv.append(room)
+                G_prv = np.stack(G_prv, axis=0).T
+                G_prvs.append(G_prv)
+        G_prvs = np.stack(G_prvs, axis=0)
+    else:
+        G_prvs = None
+
     # Compute group assignments.
-    random_cost, GsMC, costs = solve_donuts_monte_carlo(P, C, A, T, K)
+    random_cost, GsMC, costs = solve_donuts_monte_carlo(P, C, A, T, K,
+                                                        G_prvs=G_prvs)
     best_cost, GsOpt = solve_donuts(P, C, A, T, K,
-                                    G0=GsMC)
+                                    G0=GsMC,
+                                    G_prvs=G_prvs)
     if best_cost < random_cost:
         Gs = GsOpt
         print(
-            F'Better than best from monte carlo simulation:'
+            F'Optimization: Better than best from monte carlo simulation:'
             + F'{best_cost} < {random_cost}'
         )
     else:
         Gs = GsMC
         print(
-            F'Worse than best from monte carlo simulation:'
+            F'Optimization: worse than best from monte carlo simulation:'
             + F'{best_cost} >= {random_cost}'
         )
     #plt.hist(costs, bins=32)
     #plt.axvline(x=best_cost, color='r')
     #plt.show()
+
+    # Account for `G_prvs` in below validation...
+    if G_prvs is not None:
+        Gs = np.concatenate([G_prvs, Gs], axis=0)
 
     # As validation, look for overlaps.
     mask = 1 - np.eye(N)
@@ -493,6 +550,8 @@ def main():
             print(persons[i], persons[j])
 
     for t, G in enumerate(Gs):
+        if G_prvs is not None:
+            t = t - len(G_prvs)
         index = np.argwhere(G)
 
         groups = [[] for _ in rooms]

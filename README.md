@@ -1,10 +1,22 @@
 ## Donut Time
 
 Script for IM^2 lab donut time, discussion group assignment.
+Automatically tracks history.
+Takes the best result between MINLP solution and monte carlo simulation.
 
 ## How to run
 
-First, install `ipopt` binary and put it somewhere in your path. Then,
+### IpOpt installation
+First, install `ipopt` binary and put it somewhere in your path.
+One way to do so is as follows:
+```bash
+$ wget https://www.coin-or.org/download/binary/Ipopt/Ipopt-3.7.1-linux-x86_64-gcc4.3.2.tgz
+$ dtrx Ipopt-3.7.1-linux-x86_64-gcc4.3.2.tgz
+```
+
+### Running the Demo
+
+Then,
 
 ```bash
 $ ./opt.sh 
