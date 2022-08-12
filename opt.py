@@ -457,15 +457,15 @@ def main():
     # Fill in this week's attendance.
     attendance: List[str] = [
         'beomjoon',
-        # 'changjae',
+        'changjae',
         # 'dongchan',
-        'dongryung',
+        # 'dongryung',
         'dongwon',
         'junhyek',
         'heesang',
         'jaehyung',
         'jamie',
-        'jisu',
+        # 'jisu',
         'jiyong',
         # 'junyeob',
         'minchan',
